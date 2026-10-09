@@ -177,6 +177,29 @@ There is no blanket response-body or CONNECT lifetime timeout. Incoming
 request headers have a 10-second timeout and a 64 KiB configured limit.
 Idle incoming HTTP connections expire after 90 seconds.
 
+## Published images
+
+After all checks pass, CI publishes `linux/amd64` and `linux/arm64` images
+to `ghcr.io/<owner>/<repository>`, using the lowercase GitHub repository name.
+
+- Pushes to `master` update the `master` image tag.
+- Published releases, including prereleases, publish their Git tag as an
+  image tag, normalized to Docker tag syntax.
+- Published non-prerelease releases also update `latest`; prereleases do not.
+- Both publication paths also publish a `sha-<short-commit>` tag.
+
+Pull requests and other branch or tag pushes run checks without publishing.
+
+Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`.
+If the GHCR package already exists, ensure it grants this repository Actions
+write access. Package visibility is managed separately in GitHub Packages;
+make it public if anonymous pulls are required.
+
+CI compiles each production binary once per architecture, then uses the
+Dockerfile's `prebuilt` target with `dist/` as its build context for the
+container smoke test and publication. Ordinary Docker and Compose builds
+continue to compile from source.
+
 ## Development
 
 Go tools are recorded in go.mod. No global golangci-lint installation is
