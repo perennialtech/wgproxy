@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+go tool golangci-lint run ./...
+go test ./...
+CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/wgproxy .

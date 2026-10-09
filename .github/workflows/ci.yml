@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          go tool golangci-lint fmt
+          git diff --exit-code
+
+      - name: Lint
+        run: go tool golangci-lint run ./...
+
+      - name: Test with race detection
+        run: go test -race ./...
+
+      - name: Build static Linux binaries
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags="-s -w" \
+              -o "dist/wgproxy-linux-$arch" .
+          done
+
+      - name: Verify the unprivileged container
+        run: |
+          docker build -t wgproxy:ci .
+          docker run --rm \
+            --read-only \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges:true \
+            --entrypoint=/wgproxy \
+            wgproxy:ci unexpected-argument 2>startup-error.log && exit 1
+          grep -q 'usage:' startup-error.log

@@ -1,0 +1,7 @@
+/bin/
+/dist/
+/wireguard/*
+!/wireguard/.gitkeep
+.env
+*.prof
+coverage.out

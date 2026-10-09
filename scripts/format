@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+go tool golangci-lint fmt
+go tool golangci-lint run --fix ./...
