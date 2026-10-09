@@ -1,19 +1,14 @@
 # wgproxy
 
-An HTTP forward proxy with one isolated userspace WireGuard tunnel per
-configuration file. A single Go executable provides WireGuard, TCP/IP stacks,
-destination DNS, health checking, HTTP forwarding, and CONNECT relaying.
+An HTTP forward proxy that routes traffic through WireGuard. Each configuration file gets an isolated userspace tunnel, so profiles can share the same private IP and DNS addresses.
 
-No TUN device, Linux network namespaces, privileged container, or NET_ADMIN
-capability is required. Each profile can use the same private interface and
-DNS addresses as every other profile.
+Runs as a single Go executable or an unprivileged container. No TUN device, network namespaces, or `NET_ADMIN` capability is required.
 
-## Run with Docker
+## Quick start
 
-Place provider configurations under `wireguard/`, with names such as
-`japan-1.conf` and `japan-2.conf`. Files must be readable by the container's
-UID/GID, `65532:65532`. Keep the configuration directory private to the
-accounts that need it. Its contents are ignored by Git.
+Place your WireGuard profiles in `wireguard/`, for example `japan-1.conf` and `japan-2.conf`. The files must be readable by the container's UID/GID, `65532:65532`. Keep the directory private; its contents are ignored by Git.
+
+The file in [examples/](examples/) is a template, not a working profile.
 
 ```sh
 docker compose up --build -d
@@ -21,189 +16,120 @@ docker compose logs -f
 curl --proxy http://127.0.0.1:8080 https://api.ipify.org
 ```
 
-The example file under `examples/` is a template, not a working profile.
+Profiles become available after their first successful health check. Restart the service after changing configuration files.
 
-The image contains CA certificates and runs as a non-root user. Compose
-publishes the proxy only on host loopback. There is no proxy authentication:
-do not expose it publicly or to untrusted Docker-network clients.
+Compose publishes the proxy on host loopback only. The image includes CA certificates and runs as a non-root user.
 
-The service reads configurations once at startup. Restart it after changing
-profiles. Different profiles are not guaranteed to have different public
-exit IP addresses. The VPN provider must permit simultaneous use of the
-configured client identities.
+> There is no proxy authentication. Do not expose the proxy publicly or to untrusted Docker-network clients.
 
-## Run the executable
+### Run without Docker
 
-```sh
-WG_CONFIG_DIR=./wireguard ./bin/wgproxy
-```
-
-This listens on all interfaces at port 8080. For a directly executed
-local-only proxy:
+To listen on loopback only:
 
 ```sh
 WG_CONFIG_DIR=./wireguard PROXY_ADDR=127.0.0.1:8080 ./bin/wgproxy
 ```
 
-Configure applications with an HTTP proxy URL. HTTPS destinations still use
-an `http://` proxy URL because the client establishes an HTTP CONNECT tunnel:
+Without `PROXY_ADDR`, the executable listens on all interfaces at port 8080.
+
+### Configure your application
+
+Use an `http://` proxy URL for both HTTP and HTTPS destinations. HTTPS uses an HTTP CONNECT tunnel:
 
 ```sh
 HTTPS_PROXY=http://127.0.0.1:8080 curl https://api.ipify.org
 ```
 
-SIGINT and SIGTERM initiate graceful shutdown. New work is rejected during
-draining. After the shutdown timeout, remaining requests and CONNECT tunnels
-are closed.
+Secure WebSockets work through CONNECT. Plain `ws://` Upgrade proxying is not supported.
 
-## Balancing and failures
+## How traffic is handled
 
-Plain HTTP is balanced per request, including requests on a reused
-client-to-proxy connection. HTTPS is balanced per new CONNECT tunnel.
-Everything within one CONNECT tunnel stays on its selected profile.
+Ordinary HTTP requests are balanced across healthy profiles using round robin, starting in filename order. Each new HTTPS CONNECT tunnel selects one profile and stays on it until it closes. Profiles are not guaranteed to have different public exit IPs, and your VPN provider must allow simultaneous use of the configured client identities.
 
-Profiles begin unhealthy. Successful health checks make them eligible.
-Round robin starts in filename order and skips unhealthy profiles. Selection
-is concurrency-safe; round robin does not mean equal bandwidth.
+Destination TCP connections and DNS queries stay inside the selected tunnel. There is no direct destination fallback. The host or container network carries WireGuard UDP traffic, incoming proxy and administrative connections, and DNS lookups for WireGuard endpoint hostnames.
 
-A destination connection failure returns 502, or 504 for a timeout. It does
-not mark the whole profile unhealthy and is not retried through another
-profile. Standard HTTP connection-pool recovery may retry eligible requests
-within the same profile. Once response headers have been sent, a streaming
-failure terminates the response rather than changing its status code.
+Endpoint DNS failures are retried by health checks. After successful resolution, the endpoint address is retained until restart; authenticated WireGuard endpoint roaming still works. Numeric endpoints need no bootstrap DNS.
 
-No healthy profiles, the active-operation limit, or shutdown draining
-produces 503. Invalid proxy targets produce 400. Ordinary HTTP Upgrade
-requests produce 501. Secure WebSockets work through CONNECT; plain `ws://`
-Upgrade proxying is not supported.
+A destination connection failure returns 502, or 504 for a timeout. It does not mark the profile unhealthy or retry through another profile. Standard HTTP connection-pool recovery may retry eligible requests within the same profile.
 
-The active-operation limit counts each ordinary HTTP request until its
-response finishes, and each CONNECT tunnel until it closes.
+No healthy profiles, the active-operation limit, or shutdown draining produces 503. Invalid targets produce 400; ordinary HTTP Upgrade requests produce 501.
 
-## Configuration format
+`MAX_ACTIVE` counts each HTTP request until its response finishes and each CONNECT tunnel until it closes. Bodies are streamed, with no blanket response-body or CONNECT lifetime timeout.
 
-Each `.conf` file must contain exactly one `[Interface]` and one `[Peer]`.
-Comments beginning with `#` and blank lines are ignored. Comma-separated and
-repeated Address, DNS, and AllowedIPs directives are supported.
+SIGINT and SIGTERM stop new work and begin graceful shutdown. Remaining requests and tunnels are closed after `SHUTDOWN_TIMEOUT`.
 
-Interface fields are PrivateKey, Address, DNS, optional MTU, and optional
-ListenPort. ListenPort must be omitted or zero because local UDP ports are
-allocated automatically. MTU defaults to 1420.
+## WireGuard profiles
 
-Peer fields are PublicKey, optional PresharedKey, AllowedIPs, Endpoint, and
-optional PersistentKeepalive.
+Each `.conf` file must contain exactly one `[Interface]` and one `[Peer]`. Blank lines and `#` comments are ignored. `Address`, `DNS`, and `AllowedIPs` support repeated directives and comma-separated values.
 
-An IPv4 interface address, `0.0.0.0/0`, and at least one numeric DNS server
-are required. This service intentionally does not implement split-tunnel
-routing or the complete wg-quick format.
+| Section | Required fields | Optional fields |
+| --- | --- | --- |
+| `[Interface]` | `PrivateKey`, `Address`, `DNS` | `MTU`, `ListenPort` |
+| `[Peer]` | `PublicKey`, `AllowedIPs`, `Endpoint` | `PresharedKey`, `PersistentKeepalive` |
 
-IPv6 is enabled only when the profile has an IPv6 interface address and
-`::/0`. A profile containing `::/0` but only an IPv4 interface address stays
-IPv4-only. IPv6 DNS servers require IPv6 to be enabled. IPv4-only profiles
-do not resolve or dial IPv6 destinations.
+Every profile needs an IPv4 interface address, `0.0.0.0/0` in `AllowedIPs`, and at least one numeric DNS server. MTU defaults to 1420. `ListenPort` must be omitted or zero; local UDP ports are allocated automatically.
 
-Unsupported fields and malformed files fail startup. Scripts such as
-PostUp and PostDown are never executed. Configuration errors identify
-fields without printing key values.
+IPv6 requires both an IPv6 interface address and `::/0` in `AllowedIPs`. IPv6 DNS servers require IPv6 to be enabled. IPv4-only profiles never resolve or dial IPv6 destinations.
 
-## Network isolation
+Split-tunnel routing and the full wg-quick format are not supported. Unsupported fields, including `PostUp` and `PostDown`, fail startup; scripts are never executed. Configuration errors identify fields without printing key values.
 
-Destination TCP connections and destination DNS use the selected profile's
-userspace stack. There is no host-network destination dialer or direct
-fallback.
+## Health and status
 
-The container's ordinary network is used for WireGuard UDP transport, proxy
-and administrative listeners, and WireGuard endpoint hostname resolution.
-Numeric endpoints need no bootstrap DNS.
+Each profile is checked independently through its tunnel. Checks use fresh connections, do not follow redirects, and require an HTTP 204 response.
 
-Endpoint DNS failures leave the profile unhealthy and are retried by its
-health worker. After successful endpoint resolution, the address is retained
-for the lifetime of the process. Restart to pick up a changed endpoint DNS
-record. Normal authenticated WireGuard endpoint roaming remains supported.
+By default, checks use `https://www.gstatic.com/generate_204`, time out after 10 seconds, and repeat 30 seconds after completion. Initial checks are staggered over one interval, with the first profile checked immediately. Set `HEALTHCHECK_URL` to an equivalent endpoint you control when needed.
 
-This is application-level egress isolation, not an OS firewall policy. The
-container must retain ordinary UDP networking to reach its VPN endpoints.
+A failed check removes the profile from new selections. A successful check restores it. Existing CONNECT tunnels are not migrated.
 
-## Health and administration
-
-Every profile is checked independently through its tunnel. Checks use fresh
-connections and do not follow redirects. The response must have status 204.
-
-The default URL is `https://www.gstatic.com/generate_204`. The default
-timeout is 10 seconds, with another check 30 seconds after completion.
-Initial checks are spread across one interval, with the first profile
-checked immediately.
-
-The check endpoint is a real availability dependency. For controlled
-deployments, use an equivalent endpoint you own. A failed check removes the
-profile from new selections; the next successful check restores it.
-Established CONNECT tunnels are not migrated.
-
-The administrative server must bind to a numeric loopback address.
-`GET /livez` reports process liveness. `GET /readyz` succeeds when the service
-is not draining and at least one profile is healthy. `GET /status` exposes
-profile IDs, health, active operations, selection counts, and the latest
-check result. It does not expose configuration keys.
+Check whether the proxy is ready:
 
 ```sh
 ./bin/wgproxy healthcheck
+
+# With Docker Compose:
 docker compose exec wgproxy /wgproxy healthcheck
 ```
 
-These commands query the local administrative listener and return a nonzero
-exit status when the service is not ready.
+These commands return a nonzero exit status when the service is not ready.
 
-## Environment
+The administrative listener defaults to `127.0.0.1:9090` and must bind to a numeric loopback address.
 
-`WG_CONFIG_DIR` defaults to `/etc/wgproxy/wireguard`.
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /livez` | Reports process liveness. |
+| `GET /readyz` | Succeeds when at least one profile is healthy and the service is not draining. |
+| `GET /status` | Shows profile IDs, health, active operations, selection counts, and the latest check result. Never exposes configuration keys. |
 
-`PROXY_ADDR` defaults to `0.0.0.0:8080`. `ADMIN_ADDR` defaults to
-`127.0.0.1:9090`.
+## Environment variables
 
-`HEALTHCHECK_URL` defaults to `https://www.gstatic.com/generate_204`.
-`HEALTHCHECK_INTERVAL` defaults to `30s`. `HEALTHCHECK_TIMEOUT` defaults to
-`10s`.
+| Variable | Default |
+| --- | --- |
+| `WG_CONFIG_DIR` | `/etc/wgproxy/wireguard` |
+| `PROXY_ADDR` | `0.0.0.0:8080` |
+| `ADMIN_ADDR` | `127.0.0.1:9090` |
+| `HEALTHCHECK_URL` | `https://www.gstatic.com/generate_204` |
+| `HEALTHCHECK_INTERVAL` | `30s` |
+| `HEALTHCHECK_TIMEOUT` | `10s` |
+| `DIAL_TIMEOUT` | `15s` |
+| `RESPONSE_HEADER_TIMEOUT` | `30s` |
+| `SHUTDOWN_TIMEOUT` | `15s` |
+| `MAX_ACTIVE` | `256` |
 
-`DIAL_TIMEOUT` defaults to `15s`. `RESPONSE_HEADER_TIMEOUT` defaults to `30s`.
-`SHUTDOWN_TIMEOUT` defaults to `15s`.
+Durations use Go syntax, such as `10s` or `1m`, and must be positive. `MAX_ACTIVE` must also be positive.
 
-`MAX_ACTIVE` defaults to `256`.
-
-Duration values use Go duration syntax. Values must be positive.
-Application proxy environment variables are not used by upstream or
-health-check transports.
-
-There is no blanket response-body or CONNECT lifetime timeout. Incoming
-request headers have a 10-second timeout and a 64 KiB configured limit.
-Idle incoming HTTP connections expire after 90 seconds.
+Incoming request headers have a 10-second timeout and a configured 64 KiB limit. Idle incoming HTTP connections expire after 90 seconds. Upstream and health-check transports ignore application proxy environment variables.
 
 ## Published images
 
-After all checks pass, CI publishes `linux/amd64` and `linux/arm64` images
-to `ghcr.io/<owner>/<repository>`, using the lowercase GitHub repository name.
+CI publishes `linux/amd64` and `linux/arm64` images to `ghcr.io/<owner>/<repository>`, using the lowercase GitHub repository name.
 
-- Pushes to `master` update the `master` image tag.
-- Published releases, including prereleases, publish their Git tag as an
-  image tag, normalized to Docker tag syntax.
-- Published non-prerelease releases also update `latest`; prereleases do not.
-- Both publication paths also publish a `sha-<short-commit>` tag.
+The `master` tag tracks successful builds from `master`. Published releases use their Git tag, normalized to Docker tag syntax. Non-prerelease releases also update `latest`. Both publication paths include a `sha-<short-commit>` tag.
 
-Pull requests and other branch or tag pushes run checks without publishing.
-
-Publishing uses the repository's `GITHUB_TOKEN` with `packages: write`.
-If the GHCR package already exists, ensure it grants this repository Actions
-write access. Package visibility is managed separately in GitHub Packages;
-make it public if anonymous pulls are required.
-
-CI compiles each production binary once per architecture, then uses the
-Dockerfile's `prebuilt` target with `dist/` as its build context for the
-container smoke test and publication. Ordinary Docker and Compose builds
-continue to compile from source.
+GHCR package visibility is managed separately in GitHub Packages. Anonymous pulls require a public package.
 
 ## Development
 
-Go tools are recorded in go.mod. No global golangci-lint installation is
-needed.
+Go tools are recorded in `go.mod`; no global golangci-lint installation is needed.
 
 ```sh
 ./scripts/format
@@ -211,51 +137,19 @@ needed.
 go test -race ./...
 ```
 
-The format script runs gofumpt and autofixes wsl_v5 issues through
-golangci-lint. The lint configuration excludes the `comments` and
-`common-false-positives` presets.
+The race detector requires a supported platform and a working C compiler. Normal tests and static production builds do not require CGO.
 
-The race detector needs a supported platform and a working C compiler.
-Normal tests and static production builds do not require CGO.
-
-Integration tests create independent WireGuard servers over loopback, with
-overlapping private addresses and tunnel-only DNS servers. They test HTTP
-round robin, CONNECT pinning, initially buffered CONNECT data, half-closes,
-DNS isolation, absence of direct TCP fallback, IPv4-only behavior, health
-selection, header stripping, streaming, trailers, operation limits, and
-forced CONNECT shutdown.
-
-The automated Docker check verifies that the static binary starts in the
-restricted runtime image. Actual VPN connectivity in Docker must be checked
-with working provider configurations.
-
-## Builds and resource measurements
+Build a static Linux binary:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
-  go build -trimpath -ldflags="-s -w" -o dist/wgproxy-linux-amd64 .
-
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-  go build -trimpath -ldflags="-s -w" -o dist/wgproxy-linux-arm64 .
-
-docker buildx build --platform linux/amd64,linux/arm64 \
-  -t your-registry/wgproxy:latest --push .
+  go build -trimpath -ldflags="-s -w" -o bin/wgproxy .
 ```
 
-Module versions and checksums are committed. Container base-image tags are
-not digest-pinned; pin reviewed digests when reproducible image inputs are
-required.
+Integration tests cover tunnel and DNS isolation, balancing, CONNECT behavior, streaming, health selection, operation limits, and shutdown. The Docker smoke test checks startup in the restricted image, not connectivity to a real VPN provider.
 
-Each profile has its own userspace TCP/IP stack and WireGuard state.
-Bodies are streamed rather than buffered in full. Connection pools are
-bounded per profile, and active work is bounded globally.
+## Verify your deployment
 
-Measure container memory with one, five, and twenty profiles, after health
-checks, during concurrent transfers, and after connections close. No fixed
-memory-per-profile claim is made.
+This is application-level egress isolation, not an OS firewall policy. Ordinary UDP networking must remain available for WireGuard endpoints.
 
-Before using real profiles for leak-sensitive traffic, capture host egress
-while breaking WireGuard connectivity. Verify that destination addresses and
-destination DNS are absent from direct egress, while endpoint UDP and any
-endpoint bootstrap DNS remain present. The self-contained tests do not
-replace packet-capture acceptance testing on the deployment network.
+Before sending leak-sensitive traffic, capture host egress while breaking WireGuard connectivity. Destination traffic and destination DNS must not appear outside the tunnel; endpoint UDP and endpoint bootstrap DNS may remain visible. Automated tests do not replace this deployment check.
