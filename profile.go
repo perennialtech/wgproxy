@@ -29,7 +29,7 @@ type profile struct {
 	forward         *httputil.ReverseProxy
 	dialTimeout     time.Duration
 
-	// Only the health worker mutates endpointSet.
+	// After construction, only the health worker mutates endpointSet.
 	endpointSet bool
 
 	mu          sync.RWMutex
@@ -81,7 +81,21 @@ func newProfile(config profileConfig, o options) (*profile, error) {
 		fmt.Fprintf(&ipc, "preshared_key=%s\n", config.presharedKey)
 	}
 
-	fmt.Fprintf(&ipc, "replace_allowed_ips=true\npersistent_keepalive_interval=%d\n", config.keepalive)
+	// Numeric endpoints need no bootstrap lookup. Install them before
+	// enabling keepalive so the peer knows where to send its handshake.
+	endpointSet := false
+	keepalive := uint16(0)
+
+	if ip, err := netip.ParseAddr(config.endpointHost); err == nil {
+		endpoint := netip.AddrPortFrom(ip, config.endpointPort)
+		fmt.Fprintf(&ipc, "endpoint=%s\n", endpoint)
+
+		endpointSet = true
+		keepalive = config.keepalive
+	}
+
+	// Hostname endpoints retain keepalive=0 until ensureEndpoint succeeds.
+	fmt.Fprintf(&ipc, "replace_allowed_ips=true\npersistent_keepalive_interval=%d\n", keepalive)
 
 	for _, prefix := range config.allowedIPs {
 		fmt.Fprintf(&ipc, "allowed_ip=%s\n", prefix)
@@ -102,6 +116,7 @@ func newProfile(config profileConfig, o options) (*profile, error) {
 		stack:       stack,
 		device:      wg,
 		dialTimeout: o.dialTimeout,
+		endpointSet: endpointSet,
 	}
 
 	p.transport = &http.Transport{
@@ -191,8 +206,10 @@ func (p *profile) ensureEndpoint(ctx context.Context) error {
 	}
 
 	endpoint := netip.AddrPortFrom(ip, p.config.endpointPort)
-	ipc := fmt.Sprintf("public_key=%s\nupdate_only=true\nendpoint=%s\n",
-		p.config.publicKey, endpoint)
+	ipc := fmt.Sprintf(
+		"public_key=%s\nupdate_only=true\nendpoint=%s\npersistent_keepalive_interval=%d\n",
+		p.config.publicKey, endpoint, p.config.keepalive,
+	)
 
 	if err := p.device.IpcSet(ipc); err != nil {
 		return fmt.Errorf("set WireGuard endpoint: %w", err)
