@@ -70,6 +70,7 @@ func TestHealthLogsEveryFailure(t *testing.T) {
 	var output bytes.Buffer
 
 	previous := slog.Default()
+
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, nil)))
 
 	defer slog.SetDefault(previous)
