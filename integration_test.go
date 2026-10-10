@@ -28,6 +28,8 @@ import (
 
 type testExit struct {
 	profile    *profile
+	stack      *netstack.Net
+	config     profileConfig
 	dnsQueries atomic.Int64
 	holdStart  chan struct{}
 	holdEnd    chan struct{}
@@ -47,11 +49,55 @@ func testKey(t *testing.T) (string, string) {
 func newTestExit(t *testing.T, id string) *testExit {
 	t.Helper()
 
+	exit := newTestExitPeer(t, id)
+
+	startTestDNS(t, exit.stack, netip.MustParseAddr("10.2.0.1"),
+		func(query dnsmessage.Message) *dnsmessage.Message {
+			exit.dnsQueries.Add(1)
+
+			return testDNSResponse(query)
+		})
+
+	exit.profile = newTestProfile(t, exit.config, defaultOptions())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	if err := exit.profile.check(ctx, "http://only-in-tunnel.invalid:8081/health"); err != nil {
+		t.Fatalf("initial tunneled health check: %v", err)
+	}
+
+	exit.profile.setHealth(nil)
+
+	return exit
+}
+
+func newTestProfile(t *testing.T, config profileConfig, o options) *profile {
+	t.Helper()
+
+	p, err := newProfile(config, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(p.close)
+
+	return p
+}
+
+// newTestExitPeer starts only the server side. Tests can install DNS servers
+// and customize the client configuration before creating or checking a profile.
+func newTestExitPeer(t *testing.T, id string) *testExit {
+	t.Helper()
+
 	serverPrivate, serverPublic := testKey(t)
 	clientPrivate, clientPublic := testKey(t)
 
 	tun, stack, err := netstack.CreateNetTUN(
-		[]netip.Addr{netip.MustParseAddr("10.2.0.1")},
+		[]netip.Addr{
+			netip.MustParseAddr("10.2.0.1"),
+			netip.MustParseAddr("fd00::1"),
+		},
 		nil,
 		1420,
 	)
@@ -63,7 +109,8 @@ func newTestExit(t *testing.T, id string) *testExit {
 	t.Cleanup(wg.Close)
 
 	ipc := fmt.Sprintf(
-		"private_key=%s\nlisten_port=0\nreplace_peers=true\npublic_key=%s\nallowed_ip=10.2.0.2/32\n",
+		"private_key=%s\nlisten_port=0\nreplace_peers=true\npublic_key=%s\n"+
+			"allowed_ip=10.2.0.2/32\nallowed_ip=fd00::2/128\n",
 		serverPrivate, clientPublic,
 	)
 	if err := wg.IpcSet(ipc); err != nil {
@@ -97,80 +144,9 @@ func newTestExit(t *testing.T, id string) *testExit {
 	}
 
 	exit := &testExit{
+		stack:     stack,
 		holdStart: make(chan struct{}, 1),
 		holdEnd:   make(chan struct{}),
-	}
-
-	// This DNS server is reachable only inside this exit's userspace stack.
-	dns, err := stack.DialUDP(&net.UDPAddr{
-		IP:   net.ParseIP("10.2.0.1"),
-		Port: 53,
-	}, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() { _ = dns.Close() })
-
-	go func() {
-		buffer := make([]byte, 4096)
-
-		for {
-			n, address, err := dns.ReadFrom(buffer)
-			if err != nil {
-				return
-			}
-
-			var query dnsmessage.Message
-			if err := query.Unpack(buffer[:n]); err != nil {
-				continue
-			}
-
-			exit.dnsQueries.Add(1)
-
-			response := dnsmessage.Message{
-				Header: dnsmessage.Header{
-					ID:                 query.ID,
-					Response:           true,
-					Authoritative:      true,
-					RecursionDesired:   query.RecursionDesired,
-					RecursionAvailable: true,
-				},
-				Questions: query.Questions,
-			}
-
-			for _, question := range query.Questions {
-				if question.Type == dnsmessage.TypeA &&
-					question.Name.String() == "only-in-tunnel.invalid." {
-					response.Answers = append(response.Answers, dnsmessage.Resource{
-						Header: dnsmessage.ResourceHeader{
-							Name:  question.Name,
-							Type:  dnsmessage.TypeA,
-							Class: dnsmessage.ClassINET,
-							TTL:   60,
-						},
-						Body: &dnsmessage.AResource{A: [4]byte{10, 2, 0, 1}},
-					})
-				}
-			}
-
-			packet, err := response.Pack()
-			if err != nil {
-				return
-			}
-
-			if _, err := dns.WriteTo(packet, address); err != nil {
-				return
-			}
-		}
-	}()
-
-	listener, err := stack.ListenTCP(&net.TCPAddr{
-		IP:   net.ParseIP("10.2.0.1"),
-		Port: 8081,
-	})
-	if err != nil {
-		t.Fatal(err)
 	}
 
 	server := &http.Server{
@@ -215,9 +191,19 @@ func newTestExit(t *testing.T, id string) *testExit {
 
 	t.Cleanup(func() { _ = server.Close() })
 
-	go func() { _ = server.Serve(listener) }()
+	for _, address := range []string{"10.2.0.1", "fd00::1"} {
+		listener, err := stack.ListenTCP(&net.TCPAddr{
+			IP:   net.ParseIP(address),
+			Port: 8081,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	config := profileConfig{
+		go func() { _ = server.Serve(listener) }()
+	}
+
+	exit.config = profileConfig{
 		id:           id,
 		privateKey:   clientPrivate,
 		publicKey:    serverPublic,
@@ -228,24 +214,6 @@ func newTestExit(t *testing.T, id string) *testExit {
 		endpointPort: port,
 		mtu:          1420,
 	}
-
-	p, err := newProfile(config, defaultOptions())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(p.close)
-
-	exit.profile = p
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	if err := p.check(ctx, "http://only-in-tunnel.invalid:8081/health"); err != nil {
-		t.Fatalf("initial tunneled health check: %v", err)
-	}
-
-	p.setHealth(nil)
 
 	return exit
 }
