@@ -563,6 +563,40 @@ func TestLimitsStreamingTrailersAndDraining(t *testing.T) {
 	}
 }
 
+func TestUpstreamFailuresRequestHealthChecks(t *testing.T) {
+	exit := newTestExit(t, "a")
+	g := newGateway([]*profile{exit.profile}, 1)
+
+	defer g.forceClose()
+
+	for _, method := range []string{http.MethodGet, http.MethodConnect} {
+		t.Run(method, func(t *testing.T) {
+			// This address is inside the tunnel, but the port has no listener.
+			request := httptest.NewRequest(method, "http://10.2.0.1:8082/", nil)
+			if method == http.MethodConnect {
+				request.RequestURI = "10.2.0.1:8082"
+			}
+
+			response := httptest.NewRecorder()
+			g.ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadGateway {
+				t.Fatalf("failed destination returned %d, want 502", response.Code)
+			}
+
+			select {
+			case <-exit.profile.healthRequests:
+			default:
+				t.Fatal("upstream failure did not request a health check")
+			}
+
+			if !exit.profile.isHealthy() {
+				t.Fatal("a destination failure directly disabled a healthy profile")
+			}
+		})
+	}
+}
+
 func TestForceCloseTerminatesConnect(t *testing.T) {
 	exit := newTestExit(t, "a")
 	g := newGateway([]*profile{exit.profile}, 1)

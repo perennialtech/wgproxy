@@ -26,6 +26,7 @@ type profile struct {
 	transport       *http.Transport
 	healthTransport *http.Transport
 	healthClient    *http.Client
+	healthRequests  chan struct{}
 	forward         *httputil.ReverseProxy
 	dialTimeout     time.Duration
 
@@ -112,11 +113,12 @@ func newProfile(config profileConfig, o options) (*profile, error) {
 	}
 
 	p := &profile{
-		config:      config,
-		stack:       stack,
-		device:      wg,
-		dialTimeout: o.dialTimeout,
-		endpointSet: endpointSet,
+		config:         config,
+		stack:          stack,
+		device:         wg,
+		dialTimeout:    o.dialTimeout,
+		endpointSet:    endpointSet,
+		healthRequests: make(chan struct{}, 1),
 	}
 
 	p.transport = &http.Transport{
@@ -154,6 +156,7 @@ func newProfile(config profileConfig, o options) (*profile, error) {
 		},
 		Transport: p.transport,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			p.requestHealthCheck(r.Context(), err)
 			upstreamError(w, err)
 			slog.Warn("HTTP upstream failed",
 				"profile", config.id,
@@ -243,6 +246,21 @@ func (p *profile) check(ctx context.Context, healthURL string) error {
 	return nil
 }
 
+func (p *profile) requestHealthCheck(ctx context.Context, err error) {
+	// A canceled client request says nothing about the tunnel. An already
+	// unhealthy profile remains on its periodic recovery-check schedule.
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) || !p.isHealthy() {
+		return
+	}
+
+	// Destination failures are only a reason to probe, not proof that the
+	// profile is unhealthy. The single health worker owns all checks.
+	select {
+	case p.healthRequests <- struct{}{}:
+	default:
+	}
+}
+
 func (p *profile) setHealth(err error) {
 	healthy := err == nil
 
@@ -259,12 +277,10 @@ func (p *profile) setHealth(err error) {
 	}
 	p.mu.Unlock()
 
-	if changed {
-		if healthy {
-			slog.Info("profile healthy", "profile", p.config.id)
-		} else {
-			slog.Warn("profile unhealthy", "profile", p.config.id, "error", err)
-		}
+	if !healthy {
+		slog.Warn("profile unhealthy", "profile", p.config.id, "error", err)
+	} else if changed {
+		slog.Info("profile healthy", "profile", p.config.id)
 	}
 }
 
@@ -305,12 +321,32 @@ func runHealth(ctx context.Context, p *profile, o options, initialDelay time.Dur
 	timer := time.NewTimer(initialDelay)
 	defer timer.Stop()
 
+	// Broken destinations must not cause an unbounded stream of probes.
+	// Do not delay checks beyond a shorter configured periodic interval.
+	recheckInterval := min(5*time.Second, o.healthInterval)
+
+	var lastStart time.Time
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-p.healthRequests:
+			if p.isHealthy() {
+				// Use a fixed deadline so repeated requests cannot keep
+				// pushing the pending check into the future.
+				timer.Reset(max(0, time.Until(lastStart.Add(recheckInterval))))
+			}
+
+			continue
 		case <-timer.C:
 		}
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		lastStart = time.Now()
 
 		checkCtx, cancel := context.WithTimeout(ctx, o.healthTimeout)
 		err := p.check(checkCtx, o.healthURL)
@@ -319,6 +355,13 @@ func runHealth(ctx context.Context, p *profile, o options, initialDelay time.Dur
 
 		if ctx.Err() != nil {
 			return
+		}
+
+		// Failures reported during this check are covered by its result;
+		// they must not create a backlog of follow-up checks.
+		select {
+		case <-p.healthRequests:
+		default:
 		}
 
 		p.setHealth(err)

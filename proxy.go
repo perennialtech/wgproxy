@@ -202,6 +202,7 @@ func headerHasToken(header http.Header, name, token string) bool {
 func (g *gateway) connect(w http.ResponseWriter, r *http.Request, p *profile, destination string) {
 	upstream, err := p.dial(r.Context(), "tcp", destination)
 	if err != nil {
+		p.requestHealthCheck(r.Context(), err)
 		upstreamError(w, err)
 		slog.Warn("CONNECT upstream failed",
 			"profile", p.config.id,

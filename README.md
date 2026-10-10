@@ -50,7 +50,7 @@ Destination TCP connections and DNS queries stay inside the selected tunnel. The
 
 Endpoint DNS failures are retried by health checks. After successful resolution, the endpoint address is retained until restart; authenticated WireGuard endpoint roaming still works. Numeric endpoints need no bootstrap DNS.
 
-A destination connection failure returns 502, or 504 for a timeout. It does not mark the profile unhealthy or retry through another profile. Standard HTTP connection-pool recovery may retry eligible requests within the same profile.
+A destination connection failure returns 502, or 504 for a timeout. It requests an early health check but does not directly mark the profile unhealthy or retry through another profile. Canceled client requests do not trigger checks. Standard HTTP connection-pool recovery may retry eligible requests within the same profile.
 
 No healthy profiles, the active-operation limit, or shutdown draining produces 503. Invalid targets produce 400; ordinary HTTP Upgrade requests produce 501.
 
@@ -77,9 +77,13 @@ Split-tunnel routing and the full wg-quick format are not supported. Unsupported
 
 Each profile is checked independently through its tunnel. Checks use fresh connections, do not follow redirects, and require an HTTP 204 response.
 
-By default, checks use `https://www.gstatic.com/generate_204`, time out after 10 seconds, and repeat 30 seconds after completion. Initial checks are staggered over one interval, with the first profile checked immediately. Set `HEALTHCHECK_URL` to an equivalent endpoint you control when needed.
+By default, checks use `https://www.gstatic.com/generate_204`, time out after 10 seconds, and normally repeat 30 seconds after completion. Initial checks are staggered over one interval, with the first profile checked immediately. Set `HEALTHCHECK_URL` to an equivalent endpoint you control when needed.
 
-A failed check removes the profile from new selections. A successful check restores it. Existing CONNECT tunnels are not migrated.
+HTTP transport errors and CONNECT dial failures request an earlier check for a still-healthy profile. These requests are coalesced, and each profile runs only one check at a time. Early checks are rate-limited to one start every 5 seconds per profile, or the configured interval if shorter. Failures reported during a check are covered by that check rather than queuing another. After any check completes, the next periodic check is scheduled one interval later.
+
+A failed check removes the profile from new selections. A successful check restores it. Unhealthy profiles keep their periodic recovery-check schedule. Existing CONNECT tunnels are not migrated, and operations selected before a failed check may still report errors afterward.
+
+Every failed health check is logged, including repeated failures while already unhealthy. Successful checks are logged only on initial success or recovery. Health checks probe the path; they do not restart the tunnel or repair underlying DNS or network problems.
 
 Check whether the proxy is ready:
 
