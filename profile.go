@@ -14,7 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
@@ -73,7 +72,7 @@ func newProfile(config profileConfig, o options) (*profile, error) {
 		},
 	}
 
-	wg := device.NewDevice(tun, conn.NewDefaultBind(), logger)
+	wg := device.NewDevice(tun, newWireGuardBind(), logger)
 
 	var ipc strings.Builder
 	fmt.Fprintf(&ipc, "private_key=%s\nreplace_peers=true\npublic_key=%s\n", config.privateKey, config.publicKey)

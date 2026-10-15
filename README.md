@@ -123,6 +123,16 @@ Durations use Go syntax, such as `10s` or `1m`, and must be positive. `MAX_ACTIV
 
 Incoming request headers have a 10-second timeout and a configured 64 KiB limit. Idle incoming HTTP connections expire after 90 seconds. Upstream and health-check transports ignore application proxy environment variables.
 
+## Memory usage
+
+Each profile owns a WireGuard device and a userspace TCP/IP stack. On Linux, WireGuard UDP uses single-packet I/O instead of packet batching and UDP offload. This avoids multiplying large message-buffer allocations by the batch size in every profile, including idle receive loops. The tradeoff is more system calls and potentially lower peak throughput.
+
+The Linux UDP bind uses OS routing to select source addresses; it does not retain sticky source-address information from incoming packets. Multihomed deployments must have suitable routing for their WireGuard endpoints.
+
+Active TCP streams, queued data, and the Go runtime still consume memory. `MAX_ACTIVE` limits operations, not bytes, and RSS alone does not establish a memory leak. Compare memory under equivalent traffic and profile counts, including after traffic subsides.
+
+For a workload-specific soft Go memory target, set the standard `GOMEMLIMIT` environment variable. It is not a hard RSS or container limit and cannot reclaim live buffers. Leave headroom below any container memory limit and check throughput and GC overhead under load.
+
 ## Published images
 
 CI publishes `linux/amd64` and `linux/arm64` images to `ghcr.io/<owner>/<repository>`, using the lowercase GitHub repository name.
