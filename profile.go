@@ -32,23 +32,28 @@ type profile struct {
 	// After construction, only the health worker mutates endpointSet.
 	endpointSet bool
 
-	mu          sync.RWMutex
-	checked     bool
-	healthy     bool
-	lastSuccess time.Time
-	lastError   string
+	mu           sync.RWMutex
+	checked      bool
+	healthy      bool
+	lastSuccess  time.Time
+	lastCheck    time.Time
+	failedChecks uint64
+	lastError    string
 
 	active   atomic.Int64
 	selected atomic.Uint64
 }
 
 type profileStatus struct {
-	ID             string     `json:"id"`
-	Healthy        bool       `json:"healthy"`
-	Active         int64      `json:"active"`
-	Selections     uint64     `json:"selections"`
-	LastSuccessful *time.Time `json:"last_successful_check,omitempty"`
-	LastError      string     `json:"last_error,omitempty"`
+	ID                  string     `json:"id"`
+	Checked             bool       `json:"checked"`
+	Healthy             bool       `json:"healthy"`
+	ConsecutiveFailures uint64     `json:"consecutive_failures"`
+	LastCheck           *time.Time `json:"last_check,omitempty"`
+	Active              int64      `json:"active"`
+	Selections          uint64     `json:"selections"`
+	LastSuccessful      *time.Time `json:"last_successful_check,omitempty"`
+	LastError           string     `json:"last_error,omitempty"`
 }
 
 func newProfile(config profileConfig, o options) (*profile, error) {
@@ -267,7 +272,14 @@ func (p *profile) setHealth(err error) {
 	changed := !p.checked || p.healthy != healthy
 	p.checked = true
 	p.healthy = healthy
+	p.lastCheck = time.Now().UTC()
 	p.lastError = ""
+
+	if healthy {
+		p.failedChecks = 0
+	} else {
+		p.failedChecks++
+	}
 
 	if healthy {
 		p.lastSuccess = time.Now().UTC()
@@ -295,11 +307,18 @@ func (p *profile) status() profileStatus {
 	defer p.mu.RUnlock()
 
 	result := profileStatus{
-		ID:         p.config.id,
-		Healthy:    p.healthy,
-		Active:     p.active.Load(),
-		Selections: p.selected.Load(),
-		LastError:  p.lastError,
+		ID:                  p.config.id,
+		Checked:             p.checked,
+		Healthy:             p.healthy,
+		ConsecutiveFailures: p.failedChecks,
+		Active:              p.active.Load(),
+		Selections:          p.selected.Load(),
+		LastError:           p.lastError,
+	}
+
+	if !p.lastCheck.IsZero() {
+		lastCheck := p.lastCheck
+		result.LastCheck = &lastCheck
 	}
 
 	if !p.lastSuccess.IsZero() {
@@ -313,6 +332,7 @@ func (p *profile) status() profileStatus {
 func (p *profile) close() {
 	p.transport.CloseIdleConnections()
 	p.healthTransport.CloseIdleConnections()
+	_ = p.device.Down()
 	p.device.Close()
 }
 

@@ -132,9 +132,66 @@ func run(ctx context.Context, o options) error {
 
 	var serveErr error
 
-	select {
-	case <-ctx.Done():
-	case serveErr = <-serveErrors:
+	monitor := time.NewTicker(30 * time.Second)
+	defer monitor.Stop()
+
+serviceLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			break serviceLoop
+		case serveErr = <-serveErrors:
+			break serviceLoop
+		case <-monitor.C:
+			status := g.status()
+
+			var (
+				healthy          int
+				checked          int
+				repeatedFailures int
+				states           []profileStatus
+			)
+
+			for _, p := range profiles {
+				state := p.status()
+
+				states = append(states, state)
+				if state.Healthy {
+					healthy++
+				}
+
+				if state.Checked {
+					checked++
+				}
+
+				if state.ConsecutiveFailures >= 2 {
+					repeatedFailures++
+				}
+			}
+
+			slog.Info("proxy status",
+				"active", status.Active, "max_active", status.MaxActive,
+				"open_tunnels", status.OpenTunnels,
+				"full_for_seconds", status.FullForSeconds,
+				"oldest_tunnel_seconds", status.OldestTunnelSeconds,
+				"completed_total", status.Completed,
+				"rejected_capacity_total", status.RejectedCapacity,
+				"rejected_profiles_total", status.RejectedProfiles,
+				"half_closed_timeouts_total", status.HalfCloseTimeouts,
+				"last_activity_seconds", status.LastActivitySeconds,
+				"last_rejection_seconds", status.LastRejectionSeconds,
+				"healthy_profiles", healthy, "checked_profiles", checked,
+				"repeatedly_failed_profiles", repeatedFailures, "profiles", len(profiles))
+
+			if eligibleForRestart(states, status.Active) && g.beginRecovery() {
+				slog.Error("all WireGuard profiles failed repeated probes without active operations; restarting",
+					"profiles", len(profiles), "active", status.Active)
+
+				serveErr = errors.New("all WireGuard profiles failed repeated checks")
+
+				break serviceLoop
+			}
+		}
 	}
 
 	slog.Info("draining")
@@ -179,6 +236,25 @@ func run(ctx context.Context, o options) error {
 	healthWorkers.Wait()
 
 	return serveErr
+}
+
+// HTTP health endpoints are not proof that an existing CONNECT tunnel is
+// broken. Restart only when repeated probes establish total loss of service
+// and no currently accepted operation would be interrupted. Requiring two
+// completed failed checks for *every* profile also respects long and staggered
+// initial or periodic check intervals.
+func eligibleForRestart(states []profileStatus, active int) bool {
+	if active != 0 || len(states) == 0 {
+		return false
+	}
+
+	for _, p := range states {
+		if !p.Checked || p.Healthy || p.ConsecutiveFailures < 2 {
+			return false
+		}
+	}
+
+	return true
 }
 
 func healthcheckCommand() error {
