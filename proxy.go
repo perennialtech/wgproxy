@@ -27,6 +27,7 @@ type gateway struct {
 	next        int
 
 	mu                 sync.Mutex
+	fullSince          time.Time
 	draining           bool
 	closed             bool
 	tunnels            map[*tunnel]struct{}
@@ -34,6 +35,7 @@ type gateway struct {
 	slots              chan struct{}
 	rejectedCapacity   atomic.Uint64
 	rejectedProfiles   atomic.Uint64
+	halfCloseTimeouts  atomic.Uint64
 	completed          atomic.Uint64
 	lastActivity       atomic.Int64
 	lastCapacityReject atomic.Int64
@@ -85,6 +87,8 @@ func (g *gateway) begin() bool {
 	select {
 	case g.slots <- struct{}{}:
 		g.active.Add(1)
+		g.noteActivity()
+
 		return true
 	default:
 		total := g.rejectedCapacity.Add(1)
@@ -101,7 +105,10 @@ func (g *gateway) begin() bool {
 }
 
 func (g *gateway) end() {
+	g.mu.Lock()
 	<-g.slots
+	g.fullSince = time.Time{}
+	g.mu.Unlock()
 	g.completed.Add(1)
 	g.noteActivity()
 	g.active.Done()
@@ -218,7 +225,44 @@ func (g *gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	p.forward.ServeHTTP(w, r)
+	if r.Body != nil {
+		r.Body = &activityReadCloser{ReadCloser: r.Body, activity: g.noteActivity}
+	}
+
+	p.forward.ServeHTTP(&activityResponseWriter{ResponseWriter: w, activity: g.noteActivity}, r)
+}
+
+type activityReadCloser struct {
+	io.ReadCloser
+	activity func()
+}
+
+func (r *activityReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.activity()
+	}
+
+	return n, err
+}
+
+type activityResponseWriter struct {
+	http.ResponseWriter
+	activity func()
+}
+
+func (w *activityResponseWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	if n > 0 {
+		w.activity()
+	}
+
+	return n, err
+}
+
+// Preserve optional response-controller capabilities such as streaming flush.
+func (w *activityResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func headerHasToken(header http.Header, name, token string) bool {
@@ -270,7 +314,14 @@ func (g *gateway) connect(w http.ResponseWriter, r *http.Request, p *profile, de
 
 	// buffered.Reader may already contain application bytes sent immediately
 	// after CONNECT headers. Reading directly from client would lose them.
-	relayWithIdleTimeout(client, upstream, buffered.Reader, halfClosedIdleTimeout, g.noteActivity)
+	relayWithIdleTimeout(client, upstream, buffered.Reader, halfClosedIdleTimeout, g.noteActivity,
+		func(direction string) {
+			total := g.halfCloseTimeouts.Add(1)
+			slog.Warn("CONNECT half-closed peer idle timeout",
+				"profile", p.config.id, "destination", destination,
+				"direction", direction, "idle_timeout", halfClosedIdleTimeout,
+				"half_closed_timeouts_total", total)
+		})
 }
 
 // Once either peer half-closes, idle reads on the opposite peer must end.
@@ -305,27 +356,59 @@ func (r *relayReader) arm() {
 	_ = r.conn.SetReadDeadline(time.Now().Add(r.idle))
 }
 
-func relayWithIdleTimeout(client, upstream net.Conn, clientReader io.Reader, idle time.Duration, activity func()) {
+type relayWriter struct {
+	conn     net.Conn
+	idle     time.Duration
+	armed    atomic.Bool
+	activity func()
+}
+
+func (w *relayWriter) Write(p []byte) (int, error) {
+	if w.armed.Load() {
+		if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
+			return 0, err
+		}
+	}
+
+	n, err := w.conn.Write(p)
+	if n > 0 && w.activity != nil {
+		w.activity()
+	}
+
+	return n, err
+}
+
+func (w *relayWriter) arm() {
+	w.armed.Store(true)
+	_ = w.conn.SetWriteDeadline(time.Now().Add(w.idle))
+}
+
+func relayWithIdleTimeout(client, upstream net.Conn, clientReader io.Reader, idle time.Duration, activity func(), onTimeout func(string)) {
 	clientRead := &relayReader{source: clientReader, conn: client, idle: idle, activity: activity}
 	upstreamRead := &relayReader{source: upstream, conn: upstream, idle: idle, activity: activity}
+	clientWrite := &relayWriter{conn: client, idle: idle, activity: activity}
+	upstreamWrite := &relayWriter{conn: upstream, idle: idle, activity: activity}
 	done := make(chan struct{}, 2)
 
-	copyDirection := func(direction string, destination net.Conn, source, opposite *relayReader) {
+	copyDirection := func(direction string, destination *relayWriter, source, oppositeReader *relayReader, oppositeWriter *relayWriter) {
 		defer func() { done <- struct{}{} }()
 
 		_, err := io.Copy(destination, source)
 		if err == nil {
-			if halfCloser, ok := destination.(interface{ CloseWrite() error }); ok {
+			if halfCloser, ok := destination.conn.(interface{ CloseWrite() error }); ok {
 				err = halfCloser.CloseWrite()
 			} else {
-				err = destination.Close()
+				err = destination.conn.Close()
 			}
 		}
 
 		if err != nil {
 			var networkError net.Error
-			if source.armed.Load() && errors.As(err, &networkError) && networkError.Timeout() {
-				slog.Warn("CONNECT half-closed peer idle timeout", "direction", direction, "idle_timeout", idle)
+			if (source.armed.Load() || destination.armed.Load()) &&
+				errors.As(err, &networkError) && networkError.Timeout() {
+				if onTimeout != nil {
+					onTimeout(direction)
+				}
 			}
 
 			_ = client.Close()
@@ -334,10 +417,14 @@ func relayWithIdleTimeout(client, upstream net.Conn, clientReader io.Reader, idl
 			return
 		}
 
-		opposite.arm()
+		// A half-close permits remaining traffic, but not unbounded silence
+		// while reading or writing to the other connection.
+		oppositeReader.arm()
+		oppositeWriter.arm()
 	}
-	go copyDirection("client_to_upstream", upstream, clientRead, upstreamRead)
-	go copyDirection("upstream_to_client", client, upstreamRead, clientRead)
+
+	go copyDirection("client_to_upstream", upstreamWrite, clientRead, upstreamRead, clientWrite)
+	go copyDirection("upstream_to_client", clientWrite, upstreamRead, clientRead, upstreamWrite)
 
 	<-done
 	<-done
@@ -348,8 +435,10 @@ type gatewayStatus struct {
 	MaxActive           int    `json:"max_active"`
 	OpenTunnels         int    `json:"open_tunnels"`
 	OldestTunnelSeconds int64  `json:"oldest_tunnel_seconds"`
+	FullForSeconds      int64  `json:"full_for_seconds"`
 	RejectedCapacity    uint64 `json:"rejected_capacity_total"`
 	RejectedProfiles    uint64 `json:"rejected_profiles_total"`
+	HalfCloseTimeouts   uint64 `json:"half_closed_timeouts_total"`
 	Completed           uint64 `json:"completed_total"`
 }
 
@@ -366,13 +455,18 @@ func (g *gateway) status() gatewayStatus {
 
 	result := gatewayStatus{
 		Active: len(g.slots), MaxActive: cap(g.slots),
-		OpenTunnels:      len(g.tunnels),
-		RejectedCapacity: g.rejectedCapacity.Load(),
-		RejectedProfiles: g.rejectedProfiles.Load(),
-		Completed:        g.completed.Load(),
+		OpenTunnels:       len(g.tunnels),
+		RejectedCapacity:  g.rejectedCapacity.Load(),
+		RejectedProfiles:  g.rejectedProfiles.Load(),
+		HalfCloseTimeouts: g.halfCloseTimeouts.Load(),
+		Completed:         g.completed.Load(),
 	}
 	if !oldest.IsZero() {
 		result.OldestTunnelSeconds = int64(time.Since(oldest).Seconds())
+	}
+
+	if !g.fullSince.IsZero() {
+		result.FullForSeconds = int64(time.Since(g.fullSince).Seconds())
 	}
 
 	return result
@@ -384,10 +478,15 @@ func (g *gateway) status() gatewayStatus {
 func (g *gateway) stalled(now time.Time) bool {
 	const stallTimeout = 3 * time.Minute
 
-	status := g.status()
+	g.mu.Lock()
+	fullSince := g.fullSince
+	full := len(g.slots) == cap(g.slots)
+	g.mu.Unlock()
+
 	lastRejected := g.lastCapacityReject.Load()
 
-	return status.Active == status.MaxActive &&
+	return full && !fullSince.IsZero() &&
+		now.Sub(fullSince) >= stallTimeout &&
 		lastRejected > 0 &&
 		now.Sub(time.Unix(0, lastRejected)) < time.Minute &&
 		now.Sub(time.Unix(0, g.lastActivity.Load())) >= stallTimeout

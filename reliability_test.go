@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"io"
 	"net"
@@ -54,6 +55,9 @@ func TestCapacityReadinessAndStatus(t *testing.T) {
 	}
 
 	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
+	g.mu.Lock()
+	g.fullSince = time.Now().Add(-4 * time.Minute)
+	g.mu.Unlock()
 
 	if !g.stalled(time.Now()) {
 		t.Fatal("stalled proxy must request recovery")
@@ -103,7 +107,7 @@ func TestAbandonedHalfClosedRelayReleasesSlot(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		relayWithIdleTimeout(client, upstream, bufio.NewReader(client), 70*time.Millisecond, nil)
+		relayWithIdleTimeout(client, upstream, bufio.NewReader(client), 70*time.Millisecond, nil, nil)
 		close(done)
 	}()
 
@@ -133,7 +137,7 @@ func TestHalfClosedRelayAllowsStreamingResponse(t *testing.T) {
 	done := make(chan struct{})
 
 	go func() {
-		relayWithIdleTimeout(client, upstream, bufio.NewReader(client), 100*time.Millisecond, nil)
+		relayWithIdleTimeout(client, upstream, bufio.NewReader(client), 100*time.Millisecond, nil, nil)
 		close(done)
 	}()
 
@@ -177,5 +181,100 @@ func TestHalfClosedRelayAllowsStreamingResponse(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("relay did not finish after both half-closes")
+	}
+}
+
+func TestBlockedHalfClosedWriteReleasesSlot(t *testing.T) {
+	client, clientPeer := tcpPair(t)
+
+	upstream, upstreamPeer := tcpPair(t)
+	if err := client.(*net.TCPConn).SetWriteBuffer(1024); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		relayWithIdleTimeout(client, upstream, bufio.NewReader(client), 80*time.Millisecond, nil, nil)
+		close(done)
+	}()
+
+	if err := clientPeer.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := upstreamPeer.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := upstreamPeer.Read(make([]byte, 1))
+	if err != io.EOF {
+		t.Fatalf("client FIN was not forwarded: %v", err)
+	}
+
+	// The client stops reading, so an upstream stream blocks while writing to
+	// the client socket, not while reading upstream bytes.
+	pumpDone := make(chan struct{})
+	go func() {
+		defer close(pumpDone)
+
+		_ = upstreamPeer.SetWriteDeadline(time.Now().Add(2 * time.Second))
+
+		chunk := bytes.Repeat([]byte("x"), 64<<10)
+		for range 256 {
+			if _, err := upstreamPeer.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("blocked write retained relay after half-close idle timeout")
+	}
+
+	<-pumpDone
+}
+
+func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
+	g := newGateway(nil, 1)
+	defer g.forceClose()
+
+	g.lastActivity.Store(time.Now().Add(-time.Hour).UnixNano())
+
+	if !g.begin() {
+		t.Fatal("cannot occupy slot")
+	}
+	defer g.end()
+
+	if g.begin() {
+		t.Fatal("should be full")
+	}
+
+	if g.stalled(time.Now()) {
+		t.Fatal("newly accepted request must restart inactivity clock")
+	}
+
+	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
+
+	writer := &activityResponseWriter{ResponseWriter: httptest.NewRecorder(), activity: g.noteActivity}
+	if _, err := writer.Write([]byte("streaming")); err != nil {
+		t.Fatal(err)
+	}
+
+	if g.stalled(time.Now()) {
+		t.Fatal("HTTP streaming output must count as progress")
+	}
+
+	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
+
+	reader := &activityReadCloser{ReadCloser: io.NopCloser(strings.NewReader("upload")), activity: g.noteActivity}
+	if _, err := reader.Read(make([]byte, 16)); err != nil {
+		t.Fatal(err)
+	}
+
+	if g.stalled(time.Now()) {
+		t.Fatal("HTTP request upload must count as progress")
 	}
 }

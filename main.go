@@ -155,10 +155,12 @@ serviceLoop:
 			slog.Info("proxy status",
 				"active", status.Active, "max_active", status.MaxActive,
 				"open_tunnels", status.OpenTunnels,
+				"full_for_seconds", status.FullForSeconds,
 				"oldest_tunnel_seconds", status.OldestTunnelSeconds,
 				"completed_total", status.Completed,
 				"rejected_capacity_total", status.RejectedCapacity,
 				"rejected_profiles_total", status.RejectedProfiles,
+				"half_closed_timeouts_total", status.HalfCloseTimeouts,
 				"healthy_profiles", healthy, "profiles", len(profiles))
 
 			if g.stalled(time.Now()) {

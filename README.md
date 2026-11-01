@@ -85,7 +85,7 @@ A failed check removes the profile from new selections. A successful check resto
 
 Every failed health check is logged, including repeated failures while already unhealthy. Successful checks are logged only on initial success or recovery. Health checks probe the path; they do not restart the tunnel or repair underlying DNS or network problems.
 
-Every 30 seconds the proxy logs an info-level operational snapshot: active operations, capacity, tunnel counts and age, completed operations, admission rejections, and healthy-profile count. These logs are enabled by default in production. Capacity failures and abandoned half-closed tunnels additionally log warnings.
+Every 30 seconds the proxy logs an info-level operational snapshot: active operations, capacity, time at full capacity, tunnel counts and age, completed operations, admission rejections, and healthy-profile count. These logs are enabled by default in production. Capacity failures and abandoned half-closed tunnels additionally log warnings; timeout warnings identify the profile, destination, direction, and cumulative count.
 
 Check whether the proxy is ready:
 
@@ -96,7 +96,7 @@ Check whether the proxy is ready:
 docker compose exec wgproxy /wgproxy healthcheck
 ```
 
-These commands return a nonzero exit status when the service is not ready. Readiness requires at least one healthy WireGuard profile, an available operation slot, and no shutdown in progress. Docker reports an unhealthy state but does not restart containers solely because a health check fails. If all slots remain occupied for three minutes without useful activity, and capacity rejections are still occurring, the proxy logs the stalled state and exits; its Docker restart policy brings it back.
+These commands return a nonzero exit status when the service is not ready. Readiness requires at least one healthy WireGuard profile, an available operation slot, and no shutdown in progress. Docker reports an unhealthy state but does not restart containers solely because a health check fails. If all slots remain continuously occupied for three minutes without useful activity, and capacity rejections are still occurring, the proxy logs the stalled state and exits; its Docker restart policy brings it back.
 
 The administrative listener defaults to `127.0.0.1:9090` and must bind to a numeric loopback address.
 
@@ -104,7 +104,7 @@ The administrative listener defaults to `127.0.0.1:9090` and must bind to a nume
 | --- | --- |
 | `GET /livez` | Reports process liveness. |
 | `GET /readyz` | Succeeds when at least one profile is healthy and the service is not draining. |
-| `GET /status` | Shows gateway active operations, capacity, open tunnels, oldest tunnel age, completed operations, cumulative rejections, and per-profile health and selections. Never exposes configuration keys. |
+| `GET /status` | Shows gateway active operations, capacity, open tunnels, oldest tunnel age, completed operations, cumulative rejections, half-close idle timeouts, and per-profile health and selections. Never exposes configuration keys. |
 
 ## Environment variables
 
