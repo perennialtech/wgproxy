@@ -130,10 +130,7 @@ func run(ctx context.Context, o options) error {
 		"profiles", len(profiles),
 		"max_active", o.maxActive)
 
-	var (
-		serveErr          error
-		allUnhealthySince time.Time
-	)
+	var serveErr error
 
 	monitor := time.NewTicker(30 * time.Second)
 	defer monitor.Stop()
@@ -147,11 +144,28 @@ serviceLoop:
 			break serviceLoop
 		case <-monitor.C:
 			status := g.status()
-			healthy := 0
+
+			var (
+				healthy          int
+				checked          int
+				repeatedFailures int
+				states           []profileStatus
+			)
 
 			for _, p := range profiles {
-				if p.isHealthy() {
+				state := p.status()
+
+				states = append(states, state)
+				if state.Healthy {
 					healthy++
+				}
+
+				if state.Checked {
+					checked++
+				}
+
+				if state.ConsecutiveFailures >= 2 {
+					repeatedFailures++
 				}
 			}
 
@@ -166,18 +180,14 @@ serviceLoop:
 				"half_closed_timeouts_total", status.HalfCloseTimeouts,
 				"last_activity_seconds", status.LastActivitySeconds,
 				"last_rejection_seconds", status.LastRejectionSeconds,
-				"healthy_profiles", healthy, "profiles", len(profiles))
+				"healthy_profiles", healthy, "checked_profiles", checked,
+				"repeatedly_failed_profiles", repeatedFailures, "profiles", len(profiles))
 
-			var restart bool
+			if eligibleForRestart(states, status.Active) && g.beginRecovery() {
+				slog.Error("all WireGuard profiles failed repeated probes without active operations; restarting",
+					"profiles", len(profiles), "active", status.Active)
 
-			allUnhealthySince, restart = unhealthyLongEnough(allUnhealthySince, healthy, time.Now())
-
-			if restart {
-				slog.Error("all WireGuard profiles unhealthy; restarting",
-					"unhealthy_for", time.Since(allUnhealthySince),
-					"profiles", len(profiles))
-
-				serveErr = errors.New("all WireGuard profiles unhealthy")
+				serveErr = errors.New("all WireGuard profiles failed repeated checks")
 
 				break serviceLoop
 			}
@@ -228,19 +238,23 @@ serviceLoop:
 	return serveErr
 }
 
-// Capacity exhaustion is not proof of a broken proxy: quiet, valid tunnels
-// can occupy every slot. Restart only after all WireGuard health probes
-// consistently fail, which can recover pinned endpoint DNS or device state.
-func unhealthyLongEnough(since time.Time, healthy int, now time.Time) (time.Time, bool) {
-	if healthy > 0 {
-		return time.Time{}, false
+// HTTP health endpoints are not proof that an existing CONNECT tunnel is
+// broken. Restart only when repeated probes establish total loss of service
+// and no currently accepted operation would be interrupted. Requiring two
+// completed failed checks for *every* profile also respects long and staggered
+// initial or periodic check intervals.
+func eligibleForRestart(states []profileStatus, active int) bool {
+	if active != 0 || len(states) == 0 {
+		return false
 	}
 
-	if since.IsZero() {
-		return now, false
+	for _, p := range states {
+		if !p.Checked || p.Healthy || p.ConsecutiveFailures < 2 {
+			return false
+		}
 	}
 
-	return since, now.Sub(since) >= 3*time.Minute
+	return true
 }
 
 func healthcheckCommand() error {

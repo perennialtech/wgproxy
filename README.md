@@ -83,7 +83,7 @@ HTTP transport errors and CONNECT dial failures request an earlier check for a s
 
 A failed check removes the profile from new selections. A successful check restores it. Unhealthy profiles keep their periodic recovery-check schedule. Existing CONNECT tunnels are not migrated, and operations selected before a failed check may still report errors afterward.
 
-Every failed health check is logged, including repeated failures while already unhealthy. Successful checks are logged only on initial success or recovery. Health checks probe the path; they do not restart the tunnel or repair underlying DNS or network problems.
+Every failed health check is logged, including repeated failures while already unhealthy. Per-profile status includes whether the initial probe completed, the last probe time, and the count of consecutive failures. Successful checks are logged only on initial success or recovery. Health checks probe the path; they do not restart the tunnel or repair underlying DNS or network problems.
 
 Every 30 seconds the proxy logs an info-level operational snapshot: active operations, capacity, time at full capacity, tunnel counts and age, completed operations, admission rejections, time since useful traffic and the last capacity rejection, and healthy-profile count. These logs are enabled by default in production. Capacity failures and abandoned half-closed tunnels additionally log warnings; timeout warnings identify the profile, destination, direction, and cumulative count.
 
@@ -96,7 +96,7 @@ Check whether the proxy is ready:
 docker compose exec wgproxy /wgproxy healthcheck
 ```
 
-These commands return a nonzero exit status when the service is not ready. Readiness requires at least one healthy WireGuard profile, an available operation slot, and no shutdown in progress. Docker reports an unhealthy state but does not restart containers solely because a health check fails. If all WireGuard profiles remain unhealthy for three minutes, the proxy logs the failure and exits so its Docker restart policy can recover device and endpoint state. Full capacity alone never restarts the process: valid but idle CONNECT sessions must not be disconnected.
+These commands return a nonzero exit status when the service is not ready. Readiness requires at least one healthy WireGuard profile, an available operation slot, and no shutdown in progress. Docker reports an unhealthy state but does not restart containers solely because a health check fails. If every WireGuard profile completes two consecutive unsuccessful probes and no requests or CONNECT tunnels remain active, the proxy logs the failure and exits so its Docker restart policy can refresh device and endpoint state. The restart decision respects the configured probe interval, including staggered initial probes, and never interrupts active work. Failed probes caused by an external health endpoint cannot by themselves terminate functioning connections. Full capacity alone never restarts the process.
 
 The administrative listener defaults to `127.0.0.1:9090` and must bind to a numeric loopback address.
 

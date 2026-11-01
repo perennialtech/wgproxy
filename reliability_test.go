@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -54,10 +56,10 @@ func TestCapacityReadinessAndStatus(t *testing.T) {
 		t.Fatalf("unexpected counters: %+v", payload.Gateway)
 	}
 
-	// Exhausted slots may be occupied by valid idle sessions; readiness
-	// reports overload without triggering an indiscriminate process restart.
-	if since, restart := unhealthyLongEnough(time.Now().Add(-time.Hour), 1, time.Now()); restart || !since.IsZero() {
-		t.Fatal("healthy profiles must prevent a whole-process restart")
+	// Capacity is not evidence that existing sessions have failed.
+	state := []profileStatus{{Checked: true, Healthy: false, ConsecutiveFailures: 3}}
+	if eligibleForRestart(state, 1) {
+		t.Fatal("cannot restart with accepted active operations")
 	}
 }
 
@@ -267,23 +269,52 @@ func TestHTTPProgressAndHealthRecovery(t *testing.T) {
 		t.Fatal("HTTP request upload did not record progress")
 	}
 
-	now := time.Now()
-
-	since, restart := unhealthyLongEnough(time.Time{}, 0, now)
-	if restart || !since.Equal(now) {
-		t.Fatal("first all-unhealthy observation must not restart immediately")
+	// Restart is only permitted after every scheduled profile has
+	// performed at least two failed probes, with no active operations.
+	states := []profileStatus{
+		{Checked: true, Healthy: false, ConsecutiveFailures: 2},
+		{Checked: false, Healthy: false, ConsecutiveFailures: 0},
+	}
+	if eligibleForRestart(states, 0) {
+		t.Fatal("restart must wait for staggered initial checks")
 	}
 
-	if _, restart := unhealthyLongEnough(since, 0, now.Add(2*time.Minute)); restart {
-		t.Fatal("transient VPN health failure must not restart")
+	states[1] = profileStatus{Checked: true, Healthy: false, ConsecutiveFailures: 1}
+	if eligibleForRestart(states, 0) {
+		t.Fatal("restart must wait for another scheduled failed check")
 	}
 
-	if _, restart := unhealthyLongEnough(since, 0, now.Add(4*time.Minute)); !restart {
-		t.Fatal("sustained complete VPN health failure must trigger recovery")
+	states[1].ConsecutiveFailures = 2
+	if !eligibleForRestart(states, 0) {
+		t.Fatal("two failed cycles with no active sessions should allow recovery")
 	}
 
-	if reset, restart := unhealthyLongEnough(since, 1, now.Add(4*time.Minute)); restart || !reset.IsZero() {
-		t.Fatal("a recovered profile must clear the restart timer")
+	if eligibleForRestart(states, 1) {
+		t.Fatal("existing CONNECT work must block process restart")
+	}
+
+	states[0].Healthy = true
+	if eligibleForRestart(states, 0) {
+		t.Fatal("working profile must prevent restart")
+	}
+
+	p := &profile{config: profileConfig{id: "probe"}}
+	p.setHealth(errors.New("probe temporarily unavailable"))
+
+	if ps := p.status(); !ps.Checked || ps.ConsecutiveFailures != 1 || ps.LastCheck == nil {
+		t.Fatalf("first probe status: %+v", ps)
+	}
+
+	p.setHealth(errors.New("probe still unavailable"))
+
+	if ps := p.status(); ps.ConsecutiveFailures != 2 || !eligibleForRestart([]profileStatus{ps}, 0) {
+		t.Fatalf("second probe status: %+v", ps)
+	}
+
+	p.setHealth(nil)
+
+	if ps := p.status(); ps.ConsecutiveFailures != 0 || !ps.Healthy || eligibleForRestart([]profileStatus{ps}, 0) {
+		t.Fatalf("recovered probe status: %+v", ps)
 	}
 }
 
@@ -325,5 +356,89 @@ func TestSlowActiveWriteSurvivesHalfCloseDeadline(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("paced stream remained blocked")
+	}
+}
+
+type countingConn struct {
+	net.Conn
+	writes atomic.Int64
+}
+
+func (c *countingConn) Write(p []byte) (int, error) {
+	c.writes.Add(1)
+	return c.Conn.Write(p)
+}
+
+func TestNormalCONNECTWriteUsesLargeBuffer(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	c := &countingConn{Conn: left}
+	writer := &relayWriter{conn: c, idle: 100 * time.Millisecond}
+	payload := bytes.Repeat([]byte("x"), 16<<10)
+	result := make(chan error, 1)
+
+	go func() {
+		n, err := writer.Write(payload)
+		if err == nil && n != len(payload) {
+			err = io.ErrShortWrite
+		}
+
+		result <- err
+	}()
+
+	got := make([]byte, len(payload))
+	if _, err := io.ReadFull(right, got); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+
+	if gotWrites := c.writes.Load(); gotWrites != 1 {
+		t.Fatalf("healthy bidirectional tunnel wrote %d chunks, expected one", gotWrites)
+	}
+}
+
+func TestRecoveryAdmissionIsAtomic(t *testing.T) {
+	p := &profile{config: profileConfig{id: "all-failed"}}
+	p.setHealth(errors.New("first failed check"))
+	p.setHealth(errors.New("second failed check"))
+
+	g := newGateway([]*profile{p}, 1)
+	defer g.forceClose()
+
+	if !g.begin() {
+		t.Fatal("could not start active operation")
+	}
+
+	if g.beginRecovery() {
+		t.Fatal("recovery must not disconnect active requests")
+	}
+
+	g.end()
+
+	p.setHealth(nil)
+
+	if g.beginRecovery() {
+		t.Fatal("recovery must not restart healthy profiles")
+	}
+
+	p.setHealth(errors.New("another failure"))
+
+	if g.beginRecovery() {
+		t.Fatal("recovery must require two completed failures")
+	}
+
+	p.setHealth(errors.New("second consecutive failure"))
+
+	if !g.beginRecovery() {
+		t.Fatal("recovery did not trigger after two failures without activity")
+	}
+
+	if g.begin() {
+		t.Fatal("restart must block new work at the same time as approving recovery")
 	}
 }

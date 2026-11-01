@@ -125,6 +125,31 @@ func (g *gateway) noteActivity() {
 	g.lastActivity.Store(time.Now().UnixNano())
 }
 
+// Make recovery admission-safe: recheck current health while holding the
+// admission lock, then stop new work in the same critical section. Monitor
+// snapshots alone cannot safely authorize a restart.
+func (g *gateway) beginRecovery() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.draining || g.closed || len(g.slots) != 0 {
+		return false
+	}
+
+	states := make([]profileStatus, 0, len(g.profiles))
+	for _, p := range g.profiles {
+		states = append(states, p.status())
+	}
+
+	if !eligibleForRestart(states, 0) {
+		return false
+	}
+
+	g.draining = true
+
+	return true
+}
+
 func (g *gateway) beginDrain() {
 	g.mu.Lock()
 	g.draining = true
@@ -376,13 +401,22 @@ type relayWriter struct {
 const relayWriteChunk = 1024
 
 func (w *relayWriter) Write(p []byte) (int, error) {
-	written := 0
+	if !w.armed.Load() {
+		// The ordinary bidirectional stream retains normal write sizing.
+		n, err := w.conn.Write(p)
+		if n > 0 && w.activity != nil {
+			w.activity()
+		}
 
+		return n, err
+	}
+
+	// After half-close, write in bounded chunks. A single slow Write can
+	// block until it has consumed the entire buffer despite ongoing progress.
+	written := 0
 	for written < len(p) {
-		if w.armed.Load() {
-			if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
-				return written, err
-			}
+		if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
+			return written, err
 		}
 
 		end := min(len(p), written+relayWriteChunk)

@@ -320,6 +320,15 @@ func TestProfileDNSRetriesShareDeadline(t *testing.T) {
 			}
 
 			if test.callerTimeout == budget {
+				// netstack's deadline and the caller's deadline expire at almost
+				// the same instant. The dial may return a timeout before the
+				// parent context's timer goroutine marks it done.
+				select {
+				case <-ctx.Done():
+				case <-time.After(250 * time.Millisecond):
+					t.Fatal("caller context did not expire after the shared deadline")
+				}
+
 				if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					t.Fatalf("caller context error = %v, want deadline exceeded", ctx.Err())
 				}
