@@ -52,9 +52,9 @@ Endpoint DNS failures are retried by health checks. After successful resolution,
 
 A destination connection failure returns 502, or 504 for a timeout. It requests an early health check but does not directly mark the profile unhealthy or retry through another profile. Canceled client requests do not trigger checks. Standard HTTP connection-pool recovery may retry eligible requests within the same profile.
 
-No healthy profiles, the active-operation limit, or shutdown draining produces 503. Invalid targets produce 400; ordinary HTTP Upgrade requests produce 501.
+No healthy profiles, the active-operation limit, or shutdown draining produces 503. Capacity rejections are logged at warning level on the first rejection and at doubling cumulative counts. Invalid targets produce 400; ordinary HTTP Upgrade requests produce 501.
 
-`MAX_ACTIVE` counts each HTTP request until its response finishes and each CONNECT tunnel until it closes. Bodies are streamed, with no blanket response-body or CONNECT lifetime timeout.
+`MAX_ACTIVE` counts each HTTP request until its response finishes and each CONNECT tunnel until it closes. Bodies are streamed, with no blanket response-body or CONNECT lifetime timeout. After either side of a CONNECT tunnel half-closes, the remaining direction has a 90-second inactivity timeout, reset whenever traffic arrives. This prevents an abandoned half-closed tunnel from retaining a slot indefinitely while allowing ongoing responses to stream.
 
 SIGINT and SIGTERM stop new work and begin graceful shutdown. Remaining requests and tunnels are closed after `SHUTDOWN_TIMEOUT`.
 
@@ -85,6 +85,8 @@ A failed check removes the profile from new selections. A successful check resto
 
 Every failed health check is logged, including repeated failures while already unhealthy. Successful checks are logged only on initial success or recovery. Health checks probe the path; they do not restart the tunnel or repair underlying DNS or network problems.
 
+Every 30 seconds the proxy logs an info-level operational snapshot: active operations, capacity, tunnel counts and age, completed operations, admission rejections, and healthy-profile count. These logs are enabled by default in production. Capacity failures and abandoned half-closed tunnels additionally log warnings.
+
 Check whether the proxy is ready:
 
 ```sh
@@ -94,7 +96,7 @@ Check whether the proxy is ready:
 docker compose exec wgproxy /wgproxy healthcheck
 ```
 
-These commands return a nonzero exit status when the service is not ready.
+These commands return a nonzero exit status when the service is not ready. Readiness requires at least one healthy WireGuard profile, an available operation slot, and no shutdown in progress. Docker reports an unhealthy state but does not restart containers solely because a health check fails. If all slots remain occupied for three minutes without useful activity, and capacity rejections are still occurring, the proxy logs the stalled state and exits; its Docker restart policy brings it back.
 
 The administrative listener defaults to `127.0.0.1:9090` and must bind to a numeric loopback address.
 
@@ -102,7 +104,7 @@ The administrative listener defaults to `127.0.0.1:9090` and must bind to a nume
 | --- | --- |
 | `GET /livez` | Reports process liveness. |
 | `GET /readyz` | Succeeds when at least one profile is healthy and the service is not draining. |
-| `GET /status` | Shows profile IDs, health, active operations, selection counts, and the latest check result. Never exposes configuration keys. |
+| `GET /status` | Shows gateway active operations, capacity, open tunnels, oldest tunnel age, completed operations, cumulative rejections, and per-profile health and selections. Never exposes configuration keys. |
 
 ## Environment variables
 

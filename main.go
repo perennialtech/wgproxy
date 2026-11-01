@@ -132,9 +132,47 @@ func run(ctx context.Context, o options) error {
 
 	var serveErr error
 
-	select {
-	case <-ctx.Done():
-	case serveErr = <-serveErrors:
+	monitor := time.NewTicker(30 * time.Second)
+	defer monitor.Stop()
+
+serviceLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			break serviceLoop
+		case serveErr = <-serveErrors:
+			break serviceLoop
+		case <-monitor.C:
+			status := g.status()
+			healthy := 0
+
+			for _, p := range profiles {
+				if p.isHealthy() {
+					healthy++
+				}
+			}
+
+			slog.Info("proxy status",
+				"active", status.Active, "max_active", status.MaxActive,
+				"open_tunnels", status.OpenTunnels,
+				"oldest_tunnel_seconds", status.OldestTunnelSeconds,
+				"completed_total", status.Completed,
+				"rejected_capacity_total", status.RejectedCapacity,
+				"rejected_profiles_total", status.RejectedProfiles,
+				"healthy_profiles", healthy, "profiles", len(profiles))
+
+			if g.stalled(time.Now()) {
+				slog.Error("proxy capacity stalled; restarting",
+					"active", status.Active, "max_active", status.MaxActive,
+					"open_tunnels", status.OpenTunnels,
+					"oldest_tunnel_seconds", status.OldestTunnelSeconds,
+					"rejected_capacity_total", status.RejectedCapacity)
+
+				serveErr = errors.New("proxy capacity stalled")
+
+				break serviceLoop
+			}
+		}
 	}
 
 	slog.Info("draining")
