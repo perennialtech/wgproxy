@@ -136,13 +136,26 @@ func (g *gateway) beginRecovery() bool {
 		return false
 	}
 
-	states := make([]profileStatus, 0, len(g.profiles))
+	// Lock every profile until the restart decision is committed. Reading
+	// their statuses one at a time permits a previously examined profile
+	// to recover before the final decision.
 	for _, p := range g.profiles {
-		states = append(states, p.status())
+		p.mu.RLock()
+	}
+	defer func() {
+		for i := len(g.profiles) - 1; i >= 0; i-- {
+			g.profiles[i].mu.RUnlock()
+		}
+	}()
+
+	if len(g.profiles) == 0 {
+		return false
 	}
 
-	if !eligibleForRestart(states, 0) {
-		return false
+	for _, p := range g.profiles {
+		if !p.checked || p.healthy || p.failedChecks < 2 {
+			return false
+		}
 	}
 
 	g.draining = true
@@ -401,22 +414,16 @@ type relayWriter struct {
 const relayWriteChunk = 1024
 
 func (w *relayWriter) Write(p []byte) (int, error) {
-	if !w.armed.Load() {
-		// The ordinary bidirectional stream retains normal write sizing.
-		n, err := w.conn.Write(p)
-		if n > 0 && w.activity != nil {
-			w.activity()
-		}
-
-		return n, err
-	}
-
-	// After half-close, write in bounded chunks. A single slow Write can
-	// block until it has consumed the entire buffer despite ongoing progress.
+	// Use bounded writes from the start of a tunnel. Otherwise a large
+	// Write already in progress could inherit a write deadline in arm()
+	// after the opposite direction half-closes, and time out even though
+	// the receiver continues making forward progress.
 	written := 0
 	for written < len(p) {
-		if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
-			return written, err
+		if w.armed.Load() {
+			if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
+				return written, err
+			}
 		}
 
 		end := min(len(p), written+relayWriteChunk)

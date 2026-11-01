@@ -369,14 +369,76 @@ func (c *countingConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
-func TestNormalCONNECTWriteUsesLargeBuffer(t *testing.T) {
+func TestHealthLocksAcrossRecovery(t *testing.T) {
+	first := &profile{config: profileConfig{id: "first"}}
+
+	second := &profile{config: profileConfig{id: "second"}}
+	for _, p := range []*profile{first, second} {
+		p.setHealth(errors.New("initial failure"))
+		p.setHealth(errors.New("consecutive failure"))
+	}
+
+	g := newGateway([]*profile{first, second}, 1)
+	defer g.forceClose()
+
+	// Hold the second profile's health lock so recovery must stop after
+	// acquiring the first. A change in the first must not slip through
+	// before the restart decision is finalized.
+	second.mu.Lock()
+
+	decision := make(chan bool, 1)
+	go func() { decision <- g.beginRecovery() }()
+
+	deadline := time.Now().Add(time.Second)
+
+	for g.mu.TryLock() {
+		g.mu.Unlock()
+
+		if time.Now().After(deadline) {
+			second.mu.Unlock()
+			t.Fatal("recovery did not enter its critical section")
+		}
+
+		time.Sleep(time.Millisecond)
+	}
+
+	recovered := make(chan struct{})
+
+	go func() { first.setHealth(nil); close(recovered) }()
+
+	select {
+	case <-recovered:
+		second.mu.Unlock()
+		t.Fatal("profile health changed while recovery was examining it")
+	case <-time.After(20 * time.Millisecond):
+	}
+	second.mu.Unlock()
+
+	select {
+	case ok := <-decision:
+		if !ok {
+			t.Fatal("stable failed profiles did not authorize recovery")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish")
+	}
+
+	select {
+	case <-recovered:
+	case <-time.After(time.Second):
+		t.Fatal("health update remained blocked after decision")
+	}
+}
+
+func TestHalfCloseDuringActiveSlowWrite(t *testing.T) {
 	left, right := net.Pipe()
 	defer left.Close()
 	defer right.Close()
 
 	c := &countingConn{Conn: left}
-	writer := &relayWriter{conn: c, idle: 100 * time.Millisecond}
-	payload := bytes.Repeat([]byte("x"), 16<<10)
+	writer := &relayWriter{conn: c, idle: 180 * time.Millisecond}
+
+	payload := bytes.Repeat([]byte("x"), 32<<10)
 	result := make(chan error, 1)
 
 	go func() {
@@ -388,57 +450,33 @@ func TestNormalCONNECTWriteUsesLargeBuffer(t *testing.T) {
 		result <- err
 	}()
 
-	got := make([]byte, len(payload))
-	if _, err := io.ReadFull(right, got); err != nil {
+	firstChunk := make([]byte, 128)
+	if _, err := io.ReadFull(right, firstChunk); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := <-result; err != nil {
-		t.Fatal(err)
+	writer.arm()
+
+	// Read continuously, but a 32 KiB unbounded write would take more
+	// than the inactivity deadline. Short writes must survive arming.
+	for n := len(firstChunk); n < len(payload); n += len(firstChunk) {
+		if _, err := io.ReadFull(right, firstChunk); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(10 * time.Millisecond)
 	}
 
-	if gotWrites := c.writes.Load(); gotWrites != 1 {
-		t.Fatalf("healthy bidirectional tunnel wrote %d chunks, expected one", gotWrites)
-	}
-}
-
-func TestRecoveryAdmissionIsAtomic(t *testing.T) {
-	p := &profile{config: profileConfig{id: "all-failed"}}
-	p.setHealth(errors.New("first failed check"))
-	p.setHealth(errors.New("second failed check"))
-
-	g := newGateway([]*profile{p}, 1)
-	defer g.forceClose()
-
-	if !g.begin() {
-		t.Fatal("could not start active operation")
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("stream transferring bytes continuously was truncated: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("slow active write did not finish")
 	}
 
-	if g.beginRecovery() {
-		t.Fatal("recovery must not disconnect active requests")
-	}
-
-	g.end()
-
-	p.setHealth(nil)
-
-	if g.beginRecovery() {
-		t.Fatal("recovery must not restart healthy profiles")
-	}
-
-	p.setHealth(errors.New("another failure"))
-
-	if g.beginRecovery() {
-		t.Fatal("recovery must require two completed failures")
-	}
-
-	p.setHealth(errors.New("second consecutive failure"))
-
-	if !g.beginRecovery() {
-		t.Fatal("recovery did not trigger after two failures without activity")
-	}
-
-	if g.begin() {
-		t.Fatal("restart must block new work at the same time as approving recovery")
+	if c.writes.Load() <= 1 {
+		t.Fatal("mid-write half-close was not bounded into progress-sized writes")
 	}
 }

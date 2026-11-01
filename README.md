@@ -54,7 +54,7 @@ A destination connection failure returns 502, or 504 for a timeout. It requests 
 
 No healthy profiles, the active-operation limit, or shutdown draining produces 503. Capacity rejections are logged at warning level on the first rejection and at doubling cumulative counts. Invalid targets produce 400; ordinary HTTP Upgrade requests produce 501.
 
-`MAX_ACTIVE` counts each HTTP request until its response finishes and each CONNECT tunnel until it closes. Bodies are streamed, with no blanket response-body or CONNECT lifetime timeout. After either side of a CONNECT tunnel half-closes, the remaining direction has a 90-second inactivity timeout, reset as data makes progress in bounded writes or reads. This prevents an abandoned half-closed tunnel from retaining a slot indefinitely while allowing ongoing responses to stream.
+`MAX_ACTIVE` counts each HTTP request until its response finishes and each CONNECT tunnel until it closes. Bodies are streamed, with no blanket response-body or CONNECT lifetime timeout. CONNECT writes use 1 KiB chunks to ensure a half-close cannot interrupt a much larger in-flight write without observing progress. After either side of a CONNECT tunnel half-closes, the remaining direction has a 90-second inactivity timeout, reset as data makes progress in bounded writes or reads. This prevents an abandoned half-closed tunnel from retaining a slot indefinitely while allowing ongoing responses to stream.
 
 SIGINT and SIGTERM stop new work and begin graceful shutdown. Remaining requests and tunnels are closed after `SHUTDOWN_TIMEOUT`.
 
