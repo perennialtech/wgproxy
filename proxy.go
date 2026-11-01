@@ -89,6 +89,10 @@ func (g *gateway) begin() bool {
 		g.active.Add(1)
 		g.noteActivity()
 
+		if len(g.slots) == cap(g.slots) {
+			g.fullSince = time.Now()
+		}
+
 		return true
 	default:
 		total := g.rejectedCapacity.Add(1)

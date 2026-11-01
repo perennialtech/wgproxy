@@ -24,6 +24,10 @@ func TestCapacityReadinessAndStatus(t *testing.T) {
 	}
 	defer g.end()
 
+	if g.fullSince.IsZero() {
+		t.Fatal("capacity admission did not set fullSince")
+	}
+
 	readiness := httptest.NewRecorder()
 	g.adminHandler().ServeHTTP(readiness, httptest.NewRequest(http.MethodGet, "/readyz", nil))
 
@@ -247,6 +251,10 @@ func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
 		t.Fatal("cannot occupy slot")
 	}
 	defer g.end()
+
+	if g.fullSince.IsZero() {
+		t.Fatal("newly saturated gateway did not record its start time")
+	}
 
 	if g.begin() {
 		t.Fatal("should be full")

@@ -106,7 +106,11 @@ func newTestExitPeer(t *testing.T, id string) *testExit {
 	}
 
 	wg := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
-	t.Cleanup(wg.Close)
+
+	t.Cleanup(func() {
+		_ = wg.Down()
+		wg.Close()
+	})
 
 	ipc := fmt.Sprintf(
 		"private_key=%s\nlisten_port=0\nreplace_peers=true\npublic_key=%s\n"+

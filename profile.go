@@ -313,6 +313,7 @@ func (p *profile) status() profileStatus {
 func (p *profile) close() {
 	p.transport.CloseIdleConnections()
 	p.healthTransport.CloseIdleConnections()
+	_ = p.device.Down()
 	p.device.Close()
 }
 
