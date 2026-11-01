@@ -54,30 +54,10 @@ func TestCapacityReadinessAndStatus(t *testing.T) {
 		t.Fatalf("unexpected counters: %+v", payload.Gateway)
 	}
 
-	if g.stalled(time.Now()) {
-		t.Fatal("fresh work should not force restart")
-	}
-
-	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
-	g.mu.Lock()
-	g.fullSince = time.Now().Add(-4 * time.Minute)
-	g.mu.Unlock()
-
-	if !g.stalled(time.Now()) {
-		t.Fatal("stalled proxy must request recovery")
-	}
-
-	g.noteActivity()
-
-	if g.stalled(time.Now()) {
-		t.Fatal("traffic must prevent restart")
-	}
-
-	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
-	g.lastCapacityReject.Store(time.Now().Add(-2 * time.Minute).UnixNano())
-
-	if g.stalled(time.Now()) {
-		t.Fatal("old rejection must not request restart")
+	// Exhausted slots may be occupied by valid idle sessions; readiness
+	// reports overload without triggering an indiscriminate process restart.
+	if since, restart := unhealthyLongEnough(time.Now().Add(-time.Hour), 1, time.Now()); restart || !since.IsZero() {
+		t.Fatal("healthy profiles must prevent a whole-process restart")
 	}
 }
 
@@ -241,7 +221,7 @@ func TestBlockedHalfClosedWriteReleasesSlot(t *testing.T) {
 	<-pumpDone
 }
 
-func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
+func TestHTTPProgressAndHealthRecovery(t *testing.T) {
 	g := newGateway(nil, 1)
 	defer g.forceClose()
 
@@ -260,8 +240,9 @@ func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
 		t.Fatal("should be full")
 	}
 
-	if g.stalled(time.Now()) {
-		t.Fatal("newly accepted request must restart inactivity clock")
+	// Request acceptance, upload bytes, and response bytes are useful traffic.
+	if time.Since(time.Unix(0, g.lastActivity.Load())) > time.Minute {
+		t.Fatal("newly admitted work did not record progress")
 	}
 
 	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
@@ -271,8 +252,8 @@ func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if g.stalled(time.Now()) {
-		t.Fatal("HTTP streaming output must count as progress")
+	if time.Since(time.Unix(0, g.lastActivity.Load())) > time.Minute {
+		t.Fatal("HTTP streaming output did not record progress")
 	}
 
 	g.lastActivity.Store(time.Now().Add(-4 * time.Minute).UnixNano())
@@ -282,7 +263,67 @@ func TestStallRecoveryAccountsForAdmissionAndHTTPProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if g.stalled(time.Now()) {
-		t.Fatal("HTTP request upload must count as progress")
+	if time.Since(time.Unix(0, g.lastActivity.Load())) > time.Minute {
+		t.Fatal("HTTP request upload did not record progress")
+	}
+
+	now := time.Now()
+
+	since, restart := unhealthyLongEnough(time.Time{}, 0, now)
+	if restart || !since.Equal(now) {
+		t.Fatal("first all-unhealthy observation must not restart immediately")
+	}
+
+	if _, restart := unhealthyLongEnough(since, 0, now.Add(2*time.Minute)); restart {
+		t.Fatal("transient VPN health failure must not restart")
+	}
+
+	if _, restart := unhealthyLongEnough(since, 0, now.Add(4*time.Minute)); !restart {
+		t.Fatal("sustained complete VPN health failure must trigger recovery")
+	}
+
+	if reset, restart := unhealthyLongEnough(since, 1, now.Add(4*time.Minute)); restart || !reset.IsZero() {
+		t.Fatal("a recovered profile must clear the restart timer")
+	}
+}
+
+func TestSlowActiveWriteSurvivesHalfCloseDeadline(t *testing.T) {
+	left, right := net.Pipe()
+	defer left.Close()
+	defer right.Close()
+
+	writer := &relayWriter{conn: left, idle: 160 * time.Millisecond}
+	writer.arm()
+
+	// The entire write takes much longer than the deadline, while every
+	// chunk moves forward. Without chunking this write times out.
+	payload := bytes.Repeat([]byte("x"), 16<<10)
+	result := make(chan error, 1)
+
+	go func() {
+		n, err := writer.Write(payload)
+		if err == nil && n != len(payload) {
+			err = io.ErrShortWrite
+		}
+
+		result <- err
+	}()
+
+	received := make([]byte, 256)
+	for range len(payload) / len(received) {
+		if _, err := io.ReadFull(right, received); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(8 * time.Millisecond)
+	}
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("slow but active write ended early: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("paced stream remained blocked")
 	}
 }

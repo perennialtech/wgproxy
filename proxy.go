@@ -78,9 +78,9 @@ func (g *gateway) choose() *profile {
 
 func (g *gateway) begin() bool {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 
 	if g.draining {
+		g.mu.Unlock()
 		return false
 	}
 
@@ -92,15 +92,18 @@ func (g *gateway) begin() bool {
 		if len(g.slots) == cap(g.slots) {
 			g.fullSince = time.Now()
 		}
+		g.mu.Unlock()
 
 		return true
 	default:
 		total := g.rejectedCapacity.Add(1)
 		g.lastCapacityReject.Store(time.Now().UnixNano())
+		active, maximum := len(g.slots), cap(g.slots)
+		g.mu.Unlock()
 
 		if total == 1 || total&(total-1) == 0 {
 			slog.Warn("proxy admission rejected", "reason", "capacity",
-				"active", len(g.slots), "max_active", cap(g.slots),
+				"active", active, "max_active", maximum,
 				"rejected_capacity_total", total)
 		}
 
@@ -367,19 +370,39 @@ type relayWriter struct {
 	activity func()
 }
 
+// Smaller writes let the deadline measure continuing progress when a peer is
+// slow but still consuming bytes. net.Conn.Write may block until its entire
+// input is accepted even while the peer keeps draining its socket.
+const relayWriteChunk = 1024
+
 func (w *relayWriter) Write(p []byte) (int, error) {
-	if w.armed.Load() {
-		if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
-			return 0, err
+	written := 0
+
+	for written < len(p) {
+		if w.armed.Load() {
+			if err := w.conn.SetWriteDeadline(time.Now().Add(w.idle)); err != nil {
+				return written, err
+			}
+		}
+
+		end := min(len(p), written+relayWriteChunk)
+		n, err := w.conn.Write(p[written:end])
+		written += n
+
+		if n > 0 && w.activity != nil {
+			w.activity()
+		}
+
+		if err != nil {
+			return written, err
+		}
+
+		if n == 0 {
+			return written, io.ErrShortWrite
 		}
 	}
 
-	n, err := w.conn.Write(p)
-	if n > 0 && w.activity != nil {
-		w.activity()
-	}
-
-	return n, err
+	return written, nil
 }
 
 func (w *relayWriter) arm() {
@@ -435,15 +458,17 @@ func relayWithIdleTimeout(client, upstream net.Conn, clientReader io.Reader, idl
 }
 
 type gatewayStatus struct {
-	Active              int    `json:"active"`
-	MaxActive           int    `json:"max_active"`
-	OpenTunnels         int    `json:"open_tunnels"`
-	OldestTunnelSeconds int64  `json:"oldest_tunnel_seconds"`
-	FullForSeconds      int64  `json:"full_for_seconds"`
-	RejectedCapacity    uint64 `json:"rejected_capacity_total"`
-	RejectedProfiles    uint64 `json:"rejected_profiles_total"`
-	HalfCloseTimeouts   uint64 `json:"half_closed_timeouts_total"`
-	Completed           uint64 `json:"completed_total"`
+	Active               int    `json:"active"`
+	MaxActive            int    `json:"max_active"`
+	OpenTunnels          int    `json:"open_tunnels"`
+	OldestTunnelSeconds  int64  `json:"oldest_tunnel_seconds"`
+	FullForSeconds       int64  `json:"full_for_seconds"`
+	RejectedCapacity     uint64 `json:"rejected_capacity_total"`
+	RejectedProfiles     uint64 `json:"rejected_profiles_total"`
+	HalfCloseTimeouts    uint64 `json:"half_closed_timeouts_total"`
+	Completed            uint64 `json:"completed_total"`
+	LastActivitySeconds  int64  `json:"last_activity_seconds"`
+	LastRejectionSeconds int64  `json:"last_rejection_seconds"`
 }
 
 func (g *gateway) status() gatewayStatus {
@@ -473,27 +498,15 @@ func (g *gateway) status() gatewayStatus {
 		result.FullForSeconds = int64(time.Since(g.fullSince).Seconds())
 	}
 
+	if last := g.lastActivity.Load(); last > 0 {
+		result.LastActivitySeconds = int64(time.Since(time.Unix(0, last)).Seconds())
+	}
+
+	if last := g.lastCapacityReject.Load(); last > 0 {
+		result.LastRejectionSeconds = int64(time.Since(time.Unix(0, last)).Seconds())
+	}
+
 	return result
-}
-
-// A persistently saturated proxy without useful work needs to exit so its
-// container restart policy can recover it. Healthcheck failure alone does not
-// restart a Docker container.
-func (g *gateway) stalled(now time.Time) bool {
-	const stallTimeout = 3 * time.Minute
-
-	g.mu.Lock()
-	fullSince := g.fullSince
-	full := len(g.slots) == cap(g.slots)
-	g.mu.Unlock()
-
-	lastRejected := g.lastCapacityReject.Load()
-
-	return full && !fullSince.IsZero() &&
-		now.Sub(fullSince) >= stallTimeout &&
-		lastRejected > 0 &&
-		now.Sub(time.Unix(0, lastRejected)) < time.Minute &&
-		now.Sub(time.Unix(0, g.lastActivity.Load())) >= stallTimeout
 }
 
 func (g *gateway) ready() (bool, string) {

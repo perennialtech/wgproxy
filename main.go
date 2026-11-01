@@ -130,7 +130,10 @@ func run(ctx context.Context, o options) error {
 		"profiles", len(profiles),
 		"max_active", o.maxActive)
 
-	var serveErr error
+	var (
+		serveErr          error
+		allUnhealthySince time.Time
+	)
 
 	monitor := time.NewTicker(30 * time.Second)
 	defer monitor.Stop()
@@ -161,16 +164,20 @@ serviceLoop:
 				"rejected_capacity_total", status.RejectedCapacity,
 				"rejected_profiles_total", status.RejectedProfiles,
 				"half_closed_timeouts_total", status.HalfCloseTimeouts,
+				"last_activity_seconds", status.LastActivitySeconds,
+				"last_rejection_seconds", status.LastRejectionSeconds,
 				"healthy_profiles", healthy, "profiles", len(profiles))
 
-			if g.stalled(time.Now()) {
-				slog.Error("proxy capacity stalled; restarting",
-					"active", status.Active, "max_active", status.MaxActive,
-					"open_tunnels", status.OpenTunnels,
-					"oldest_tunnel_seconds", status.OldestTunnelSeconds,
-					"rejected_capacity_total", status.RejectedCapacity)
+			var restart bool
 
-				serveErr = errors.New("proxy capacity stalled")
+			allUnhealthySince, restart = unhealthyLongEnough(allUnhealthySince, healthy, time.Now())
+
+			if restart {
+				slog.Error("all WireGuard profiles unhealthy; restarting",
+					"unhealthy_for", time.Since(allUnhealthySince),
+					"profiles", len(profiles))
+
+				serveErr = errors.New("all WireGuard profiles unhealthy")
 
 				break serviceLoop
 			}
@@ -219,6 +226,21 @@ serviceLoop:
 	healthWorkers.Wait()
 
 	return serveErr
+}
+
+// Capacity exhaustion is not proof of a broken proxy: quiet, valid tunnels
+// can occupy every slot. Restart only after all WireGuard health probes
+// consistently fail, which can recover pinned endpoint DNS or device state.
+func unhealthyLongEnough(since time.Time, healthy int, now time.Time) (time.Time, bool) {
+	if healthy > 0 {
+		return time.Time{}, false
+	}
+
+	if since.IsZero() {
+		return now, false
+	}
+
+	return since, now.Sub(since) >= 3*time.Minute
 }
 
 func healthcheckCommand() error {
